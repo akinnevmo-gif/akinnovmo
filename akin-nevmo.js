@@ -1,4 +1,4 @@
-// === AKIN NEVMO - COMPLETE SINGLE FILE ===
+// === AKIN NEVMO - COMPLETE SINGLE FILE WITH TRANSFER STATUS CHECKING ===
 // Save this as `akin-nevmo.js` and run with: node akin-nevmo.js
 
 require('dotenv').config();
@@ -11,15 +11,19 @@ const path = require('path');
 // ======================
 
 // Your MTN number (where all donations go)
-const PLATFORM_PHONE = '231887716973'; // Remove + and any non-digit characters
+const PLATFORM_PHONE = '231887716973';
 
-// MTN API Configuration (from your .env file)
+// MTN API Configuration
 const MTN_CONFIG = {
   consumerKey: process.env.MTN_CONSUMER_KEY || 'YOUR_CONSUMER_KEY',
   consumerSecret: process.env.MTN_CONSUMER_SECRET || 'YOUR_CONSUMER_SECRET',
   subscriptionKey: process.env.MTN_SUBSCRIPTION_KEY || 'YOUR_SUBSCRIPTION_KEY',
-  baseUrl: process.env.BASE_URL || 'https://sandbox.momodeveloper.mtn.com'
+  baseUrl: process.env.BASE_URL || 'https://sandbox.momodeveloper.mtn.com',
+  targetEnvironment: process.env.TARGET_ENVIRONMENT || 'sandbox'
 };
+
+// In-memory storage for transactions (use database in production)
+let transactions = {};
 
 // ======================
 // EXPRESS APP SETUP
@@ -28,12 +32,8 @@ const MTN_CONFIG = {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Serve static files (for any future assets)
-app.use(express.static(path.join(__dirname, 'public')));
 
 // ======================
 // MTN API FUNCTIONS
@@ -51,6 +51,7 @@ async function getAccessToken() {
         headers: {
           'Authorization': `Basic ${authString}`,
           'Ocp-Apim-Subscription-Key': MTN_CONFIG.subscriptionKey,
+          'X-Target-Environment': MTN_CONFIG.targetEnvironment,
           'Content-Type': 'application/x-www-form-urlencoded'
         }
       }
@@ -67,6 +68,16 @@ async function sendMoney(amount, recipientPhone, message, externalId = null) {
   try {
     const accessToken = await getAccessToken();
     const xReferenceId = externalId || Date.now().toString();
+    
+    // Store transaction in memory
+    transactions[xReferenceId] = {
+      id: xReferenceId,
+      amount: amount,
+      recipient: recipientPhone,
+      message: message,
+      status: 'INITIATED',
+      createdAt: new Date().toISOString()
+    };
     
     const response = await axios.post(
       `${MTN_CONFIG.baseUrl}/disbursement/v1_0/transfer`,
@@ -86,10 +97,15 @@ async function sendMoney(amount, recipientPhone, message, externalId = null) {
           'X-Reference-Id': xReferenceId,
           'Ocp-Apim-Subscription-Key': MTN_CONFIG.subscriptionKey,
           'Authorization': `Bearer ${accessToken}`,
+          'X-Target-Environment': MTN_CONFIG.targetEnvironment,
           'Content-Type': 'application/json'
         }
       }
     );
+
+    // Update transaction status
+    transactions[xReferenceId].status = 'ACCEPTED';
+    transactions[xReferenceId].mtmResponse = response.data;
 
     return {
       success: true,
@@ -98,7 +114,40 @@ async function sendMoney(amount, recipientPhone, message, externalId = null) {
     };
   } catch (error) {
     console.error('❌ MTN Transfer Error:', error.response?.data || error.message);
+    if (transactions[xReferenceId]) {
+      transactions[xReferenceId].status = 'FAILED';
+      transactions[xReferenceId].error = error.response?.data || error.message;
+    }
     throw new Error(error.response?.data?.error || 'Transfer failed');
+  }
+}
+
+// Get Transfer Status from MTN
+async function getTransferStatus(referenceId) {
+  try {
+    const accessToken = await getAccessToken();
+    
+    const response = await axios.get(
+      `${MTN_CONFIG.baseUrl}/disbursement/v1_0/transfer/${referenceId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'X-Target-Environment': MTN_CONFIG.targetEnvironment,
+          'Ocp-Apim-Subscription-Key': MTN_CONFIG.subscriptionKey
+        }
+      }
+    );
+
+    // Update transaction status
+    if (transactions[referenceId]) {
+      transactions[referenceId].status = response.data.status || 'UNKNOWN';
+      transactions[referenceId].statusDetails = response.data;
+    }
+
+    return response.data;
+  } catch (error) {
+    console.error('❌ Get Transfer Status Error:', error.response?.data || error.message);
+    throw new Error(error.response?.data?.error || 'Failed to get transfer status');
   }
 }
 
@@ -111,11 +160,13 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     platformPhone: PLATFORM_PHONE,
+    targetEnvironment: MTN_CONFIG.targetEnvironment,
+    transactionCount: Object.keys(transactions).length,
     timestamp: new Date().toISOString()
   });
 });
 
-// Donate endpoint - sends money TO your number
+// Donate endpoint
 app.post('/api/donate', async (req, res) => {
   try {
     const { phone, amount, message = 'Donation from Akin NevMo' } = req.body;
@@ -127,7 +178,6 @@ app.post('/api/donate', async (req, res) => {
       });
     }
 
-    // Validate phone number (remove non-digits)
     const cleanPhone = phone.replace(/\D/g, '');
     if (cleanPhone.length < 10) {
       return res.status(400).json({
@@ -136,13 +186,13 @@ app.post('/api/donate', async (req, res) => {
       });
     }
 
-    // Send donation TO your platform number
     const result = await sendMoney(amount, PLATFORM_PHONE, `${message} from ${cleanPhone}`);
 
     res.json({
       success: true,
-      message: `Donation of ${amount} XAF received!`,
-      transactionId: result.transactionId
+      message: `Donation of ${amount} XAF initiated!`,
+      transactionId: result.transactionId,
+      status: 'Check status using /api/transaction/${result.transactionId}'
     });
 
   } catch (error) {
@@ -153,7 +203,7 @@ app.post('/api/donate', async (req, res) => {
   }
 });
 
-// Save endpoint - sends money TO your number (savings)
+// Save endpoint
 app.post('/api/save', async (req, res) => {
   try {
     const { goal, amount, frequency = 'monthly' } = req.body;
@@ -170,7 +220,7 @@ app.post('/api/save', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Saved ${amount} XAF for "${goal}"!`,
+      message: `Savings of ${amount} XAF initiated for "${goal}"!`,
       transactionId: result.transactionId
     });
 
@@ -182,7 +232,7 @@ app.post('/api/save', async (req, res) => {
   }
 });
 
-// Withdraw endpoint - sends money FROM your number to user
+// Withdraw endpoint
 app.post('/api/withdraw', async (req, res) => {
   try {
     const { phone, amount } = req.body;
@@ -207,7 +257,7 @@ app.post('/api/withdraw', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Withdrew ${amount} XAF to ${cleanPhone}!`,
+      message: `Withdrawal of ${amount} XAF initiated!`,
       transactionId: result.transactionId
     });
 
@@ -217,6 +267,55 @@ app.post('/api/withdraw', async (req, res) => {
       error: error.message
     });
   }
+});
+
+// Get Transaction Status
+app.get('/api/transaction/:referenceId', async (req, res) => {
+  try {
+    const { referenceId } = req.params;
+    
+    // First check our local storage
+    if (transactions[referenceId]) {
+      // If status is not final, check with MTN
+      if (['INITIATED', 'ACCEPTED'].includes(transactions[referenceId].status)) {
+        const mtmStatus = await getTransferStatus(referenceId);
+        return res.json({
+          success: true,
+          transaction: transactions[referenceId],
+          mtmStatus: mtmStatus
+        });
+      }
+      
+      // Return cached status
+      return res.json({
+        success: true,
+        transaction: transactions[referenceId]
+      });
+    }
+    
+    // If not in local storage, check with MTN directly
+    const mtmStatus = await getTransferStatus(referenceId);
+    return res.json({
+      success: true,
+      message: 'Transaction found in MTN system',
+      mtmStatus: mtmStatus
+    });
+    
+  } catch (error) {
+    res.status(404).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get All Transactions (for admin/debugging)
+app.get('/api/transactions', (req, res) => {
+  res.json({
+    success: true,
+    count: Object.keys(transactions).length,
+    transactions: transactions
+  });
 });
 
 // ======================
@@ -430,6 +529,14 @@ app.get('/', (req, res) => {
             border: 1px solid #f5c6cb;
         }
         
+        .transaction-info {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-size: 14px;
+        }
+        
         .mtn-section {
             background: white;
             padding: 20px;
@@ -516,6 +623,7 @@ app.get('/', (req, res) => {
                 </button>
             </form>
             <div id="donate-status" class="status"></div>
+            <div id="donate-transaction" class="transaction-info" style="display:none;"></div>
         </div>
 
         <!-- SAVE TAB -->
@@ -544,6 +652,7 @@ app.get('/', (req, res) => {
                 </button>
             </form>
             <div id="save-status" class="status"></div>
+            <div id="save-transaction" class="transaction-info" style="display:none;"></div>
         </div>
 
         <!-- WITHDRAW TAB -->
@@ -563,6 +672,7 @@ app.get('/', (req, res) => {
                 </button>
             </form>
             <div id="withdraw-status" class="status"></div>
+            <div id="withdraw-transaction" class="transaction-info" style="display:none;"></div>
         </div>
 
         <div class="mtn-section">
@@ -584,49 +694,66 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
-        // Backend URL (same origin)
         const BACKEND_URL = '';
         
-        // Tab switching
         document.querySelectorAll('.tab-btn').forEach(button => {
             button.addEventListener('click', () => {
                 document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
                 document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
-                
                 button.classList.add('active');
                 document.getElementById(button.dataset.tab + '-tab').classList.add('active');
             });
         });
 
-        // Helper: Show status message
         function showStatus(id, message, type) {
             const statusEl = document.getElementById(id);
             statusEl.textContent = message;
             statusEl.className = 'status ' + type;
             statusEl.style.display = 'block';
-            
-            // Auto hide after 6 seconds
-            setTimeout(() => {
-                statusEl.style.display = 'none';
-            }, 6000);
+            setTimeout(() => { statusEl.style.display = 'none'; }, 6000);
         }
 
-        // Helper: Disable/enable button
+        function showTransactionInfo(id, transactionId) {
+            const infoEl = document.getElementById(id);
+            infoEl.innerHTML = \`<strong>Transaction ID:</strong> \${transactionId}<br>
+            <strong>Status:</strong> Checking...<br>
+            <button onclick="checkTransactionStatus('\${transactionId}', '\${id}')">Check Status</button>\`;
+            infoEl.style.display = 'block';
+        }
+
+        function checkTransactionStatus(transactionId, infoId) {
+            fetch(\`\${BACKEND_URL}/api/transaction/\${transactionId}\`)
+            .then(res => res.json())
+            .then(data => {
+                const infoEl = document.getElementById(infoId);
+                if (data.success) {
+                    const status = data.mtmStatus?.status || data.transaction?.status || 'UNKNOWN';
+                    infoEl.innerHTML = \`<strong>Transaction ID:</strong> \${transactionId}<br>
+                    <strong>Status:</strong> \${status}<br>
+                    <strong>Amount:</strong> \${data.transaction?.amount || 'N/A'} XAF<br>
+                    <button onclick="checkTransactionStatus('\${transactionId}', '\${infoId}')">Refresh</button>\`;
+                } else {
+                    infoEl.innerHTML = \`<strong>Error:</strong> \${data.error}\`;
+                }
+            })
+            .catch(err => {
+                document.getElementById(infoId).innerHTML = '<strong>Error:</strong> Failed to check status';
+            });
+        }
+
         function setButtonState(buttonId, disabled, text = null) {
             const btn = document.getElementById(buttonId);
             btn.disabled = disabled;
             if (text) btn.innerHTML = text;
         }
 
-        // Donate Form Handler
+        // Updated form handlers with transaction status
         document.getElementById('donate-form').addEventListener('submit', async (e) => {
             e.preventDefault();
-            
             const phone = document.getElementById('donate-phone').value.trim();
             const amount = document.getElementById('donate-amount').value;
             const message = document.getElementById('donate-message').value.trim() || 'Donation from Akin NevMo';
             
-            // Validate phone number (basic)
             if (!/^\\d{10,12}$/.test(phone.replace(/\\D/g, ''))) {
                 showStatus('donate-status', '❌ Please enter a valid MTN phone number (10-12 digits)', 'error');
                 return;
@@ -638,36 +765,28 @@ app.get('/', (req, res) => {
             try {
                 const response = await fetch(\`\${BACKEND_URL}/api/donate\`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        phone: phone,
-                        amount: amount,
-                        message: message
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone, amount, message })
                 });
                 
                 const result = await response.json();
                 
                 if (result.success) {
-                    showStatus('donate-status', \`✅ Donation of \${amount} XAF sent successfully!\`, 'success');
+                    showStatus('donate-status', \`✅ Donation initiated! Transaction ID: \${result.transactionId}\`, 'success');
+                    showTransactionInfo('donate-transaction', result.transactionId);
                     document.getElementById('donate-form').reset();
                 } else {
-                    showStatus('donate-status', \`❌ \${result.error || 'Failed to send donation'}\`, 'error');
+                    showStatus('donate-status', \`❌ \${result.error}\`, 'error');
                 }
             } catch (error) {
-                console.error('Error:', error);
                 showStatus('donate-status', '❌ Network error. Please check your connection.', 'error');
             } finally {
                 setButtonState('donate-btn', false, '<i class="fas fa-paper-plane"></i> Send Donation');
             }
         });
 
-        // Save Form Handler
         document.getElementById('save-form').addEventListener('submit', async (e) => {
             e.preventDefault();
-            
             const goal = document.getElementById('save-goal').value.trim();
             const amount = document.getElementById('save-amount').value;
             const frequency = document.getElementById('save-frequency').value;
@@ -683,40 +802,31 @@ app.get('/', (req, res) => {
             try {
                 const response = await fetch(\`\${BACKEND_URL}/api/save\`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        goal: goal,
-                        amount: amount,
-                        frequency: frequency
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ goal, amount, frequency })
                 });
                 
                 const result = await response.json();
                 
                 if (result.success) {
-                    showStatus('save-status', \`✅ Saved \${amount} XAF for "\${goal}" (\${frequency})!\`, 'success');
+                    showStatus('save-status', \`✅ Savings initiated! Transaction ID: \${result.transactionId}\`, 'success');
+                    showTransactionInfo('save-transaction', result.transactionId);
                     document.getElementById('save-form').reset();
                 } else {
-                    showStatus('save-status', \`❌ \${result.error || 'Failed to save'}\`, 'error');
+                    showStatus('save-status', \`❌ \${result.error}\`, 'error');
                 }
             } catch (error) {
-                console.error('Error:', error);
                 showStatus('save-status', '❌ Network error. Please check your connection.', 'error');
             } finally {
                 setButtonState('save-btn', false, '<i class="fas fa-save"></i> Start Saving');
             }
         });
 
-        // Withdraw Form Handler
         document.getElementById('withdraw-form').addEventListener('submit', async (e) => {
             e.preventDefault();
-            
             const amount = document.getElementById('withdraw-amount').value;
             const phone = document.getElementById('withdraw-phone').value.trim();
             
-            // Validate phone number
             if (!/^\\d{10,12}$/.test(phone.replace(/\\D/g, ''))) {
                 showStatus('withdraw-status', '❌ Please enter a valid MTN phone number (10-12 digits)', 'error');
                 return;
@@ -728,25 +838,20 @@ app.get('/', (req, res) => {
             try {
                 const response = await fetch(\`\${BACKEND_URL}/api/withdraw\`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        phone: phone,
-                        amount: amount
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone, amount })
                 });
                 
                 const result = await response.json();
                 
                 if (result.success) {
-                    showStatus('withdraw-status', \`✅ Withdrew \${amount} XAF to \${phone} successfully!\`, 'success');
+                    showStatus('withdraw-status', \`✅ Withdrawal initiated! Transaction ID: \${result.transactionId}\`, 'success');
+                    showTransactionInfo('withdraw-transaction', result.transactionId);
                     document.getElementById('withdraw-form').reset();
                 } else {
-                    showStatus('withdraw-status', \`❌ \${result.error || 'Failed to withdraw'}\`, 'error');
+                    showStatus('withdraw-status', \`❌ \${result.error}\`, 'error');
                 }
             } catch (error) {
-                console.error('Error:', error);
                 showStatus('withdraw-status', '❌ Network error. Please check your connection.', 'error');
             } finally {
                 setButtonState('withdraw-btn', false, '<i class="fas fa-wallet"></i> Withdraw to MTN');
@@ -759,10 +864,9 @@ app.get('/', (req, res) => {
 });
 
 // ======================
-// START SERVER
+// CREATE .ENV FILE IF MISSING
 // ======================
 
-// Create .env file if it doesn't exist (for first-time users)
 const fs = require('fs');
 if (!fs.existsSync('.env')) {
   fs.writeFileSync('.env', `# MTN SANDBOX CREDENTIALS
@@ -773,11 +877,17 @@ MTN_SUBSCRIPTION_KEY=YOUR_SUBSCRIPTION_KEY_HERE
 # SERVER CONFIG
 PORT=3000
 BASE_URL=https://sandbox.momodeveloper.mtn.com
+TARGET_ENVIRONMENT=sandbox
 `);
+  console.log('='.repeat(60));
   console.log('📁 Created .env file - PLEASE EDIT IT WITH YOUR MTN CREDENTIALS!');
+  console.log('='.repeat(60));
 }
 
-// Start server
+// ======================
+// START SERVER
+// ======================
+
 app.listen(PORT, () => {
   console.log('='.repeat(60));
   console.log('🚀 AKIN NEVMO IS RUNNING!');
@@ -785,5 +895,6 @@ app.listen(PORT, () => {
   console.log(`📱 All donations go to: +${PLATFORM_PHONE}`);
   console.log(`🌐 Open in browser: http://localhost:${PORT}`);
   console.log(`🔧 Edit .env file to add your MTN credentials`);
+  console.log(`🛡️  Using environment: ${MTN_CONFIG.targetEnvironment}`);
   console.log('='.repeat(60));
 });
